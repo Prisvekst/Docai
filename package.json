@@ -1,18 +1,17 @@
 {
   "name": "docai-api",
   "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "description": "Document AI API hosted on Railway",
+  "main": "server.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "node server.js"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
-  "type": "commonjs",
+  "engines": {
+    "node": ">=18"
+  },
   "dependencies": {
-    "@google-cloud/documentai": "^9.5.0",
-    "express": "^5.2.1",
-    "multer": "^2.1.0"
+    "@google-cloud/documentai": "^5.0.0",
+    "express": "^4.19.2",
+    "multer": "^1.4.5-lts.1"
   }
 }
