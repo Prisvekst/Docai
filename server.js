@@ -124,45 +124,14 @@ app.post("/process-invoice", upload.single("file"), async (req, res) => {
     const doc = result.document || {};
     const entities = Array.isArray(doc.entities) ? doc.entities : [];
 
-    // ---- EXACT-ish response shape (only from AI; nulls if missing) ----
-    const response = {
-      invoice_id: field(entities, "invoice_id").value,
-      invoice_date: field(entities, "invoice_date").value,
-      invoice_type: "invoice_statement", // constant as you used
-      currency: field(entities, "currency").value,
+    const doc = result.document || {};
+const entities = Array.isArray(doc.entities) ? doc.entities : [];
 
-      supplier_name: field(entities, "supplier_name").value,
-      supplier_website: field(entities, "supplier_website").value,
-      supplier_email: field(entities, "supplier_email").value,
-      supplier_phone: field(entities, "supplier_phone").value,
-      supplier_address: field(entities, "supplier_address").value,
-      supplier_iban: field(entities, "iban").value || field(entities, "supplier_iban").value,
-      supplier_tax_id: field(entities, "supplier_tax_id").value || field(entities, "supplier_organization_id").value,
-      supplier_payment_ref: field(entities, "payment_reference").value,
-
-      ship_to_address: field(entities, "ship_to_address").value,
-
-      total_amount: field(entities, "total_amount").value,
-      net_amount: field(entities, "net_amount").value,
-
-      line_items: extractLineItems(entities),
-      // optional debug:
-      debug: {
-        processor: { projectId: PROJECT_ID, location: LOCATION, processorId: PROCESSOR_ID },
-        file: { name: req.file.originalname, mimeType: req.file.mimetype, bytes: req.file.size },
-        entities_count: entities.length,
-      },
-    };
-
-    return res.json(response);
-  } catch (err) {
-    return res.status(500).json({
-      error: err?.message || String(err),
-      code: err?.code ?? null,
-      details: err?.details ?? null,
-    });
-  }
+return res.json({
+  entities_count: entities.length,
+  raw_entities: entities.map(e => ({
+    type: e.type,
+    mentionText: e.mentionText,
+    confidence: e.confidence
+  }))
 });
-
-const port = process.env.PORT || 8080;
-app.listen(port, () => console.log(`Running on port ${port}`));
