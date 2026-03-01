@@ -5,12 +5,14 @@ const multer = require("multer");
 const { DocumentProcessorServiceClient } = require("@google-cloud/documentai").v1;
 
 const app = express();
+app.set("json spaces", 2);
+
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 20 * 1024 * 1024 }, // 20MB
 });
 
-// ---- Env ----
+// ---- ENV ----
 const PROJECT_ID = process.env.PROJECT_ID;
 const LOCATION = process.env.LOCATION || "eu";
 const PROCESSOR_ID = process.env.PROCESSOR_ID;
@@ -27,54 +29,84 @@ function makeClient() {
 const client = makeClient();
 
 // ---- Helpers ----
-function normalizedToText(normalizedValue) {
-  if (!normalizedValue) return null;
-  if (typeof normalizedValue === "string") return normalizedValue;
-  if (typeof normalizedValue.text === "string") return normalizedValue.text;
+function nvText(nv) {
+  if (!nv) return null;
+  if (typeof nv === "string") return nv;
+  if (typeof nv.text === "string") return nv.text;
   return null;
 }
 
 function entityValue(e) {
   if (!e) return null;
-  const nv = normalizedToText(e.normalizedValue);
-  return (nv || e.mentionText || null);
+  return nvText(e.normalizedValue) || e.mentionText || null;
 }
 
-function bestEntity(entities, type) {
-  const hits = (entities || []).filter((e) => e.type === type);
+function bestEntity(list, type) {
+  const hits = (list || []).filter((e) => e.type === type);
   if (!hits.length) return null;
   hits.sort((a, b) => (b.confidence ?? 0) - (a.confidence ?? 0));
   return hits[0];
 }
 
-function pick(entities, type) {
-  const e = bestEntity(entities, type);
+function pick(list, type) {
+  const e = bestEntity(list, type);
   return {
     value: entityValue(e),
     confidence: typeof e?.confidence === "number" ? e.confidence : null,
   };
 }
 
-function pickAny(entities, types) {
-  for (const t of types) {
-    const v = pick(entities, t);
-    if (v.value) return v;
+// Flatten nested entities so we can support both “group parent with properties” and “flat” output.
+function flattenEntities(entities, prefix = "") {
+  const out = [];
+  for (const e of entities || []) {
+    const type = prefix ? `${prefix}.${e.type || "unknown"}` : (e.type || "unknown");
+    out.push({
+      type,
+      mentionText: e.mentionText || null,
+      normalizedText: nvText(e.normalizedValue),
+      confidence: typeof e.confidence === "number" ? e.confidence : null,
+      _ref: e, // internal
+    });
+    if (Array.isArray(e.properties) && e.properties.length) {
+      out.push(...flattenEntities(e.properties, type));
+    }
   }
-  return { value: null, confidence: null };
+  return out;
 }
 
-// ---- Your schema mapping (Custom Extractor types -> API fields) ----
-const MAP = {
-  invoice_date: ["fakturadato"],
-  due_date: ["forfallsdato"],
-  total_amount: ["totalsum"],
-  meter_number: ["malernr"],
-  customer_name: ["forbruker_navn"],
-  ship_to_address: ["forbruker_adresse"],
-  usage_period_kwh: ["forbruk_for_periode"],
-  surcharge: ["paaslag"],
-  price_area: ["prisomrade"],
-};
+// Get a field value from either:
+// 1) A group entity's properties (if group exists)
+// 2) A flattened entity type path (fallback)
+function getFromGroupOrFlat(entities, groupType, fieldType) {
+  const group = bestEntity(entities, groupType);
+  if (group && Array.isArray(group.properties)) {
+    const within = pick(group.properties, fieldType);
+    if (within.value !== null && within.value !== undefined && String(within.value).trim() !== "") return within.value;
+  }
+  // fallback: flat path "Group.field"
+  const flat = flattenEntities(entities);
+  const hit = flat
+    .filter((x) => x.type === `${groupType}.${fieldType}`)
+    .sort((a, b) => (b.confidence ?? 0) - (a.confidence ?? 0))[0];
+  return hit ? (hit.normalizedText || hit.mentionText) : null;
+}
+
+// Get repeated group items (optional multiple)
+function getRepeatedGroupItems(entities, groupType, schemaFields) {
+  // Some outputs: multiple group entities with same type
+  const groups = (entities || []).filter((e) => e.type === groupType);
+  if (!groups.length) return [];
+
+  return groups.map((g) => {
+    const props = Array.isArray(g.properties) ? g.properties : [];
+    const obj = {};
+    for (const f of schemaFields) {
+      obj[f] = pick(props, f).value;
+    }
+    return obj;
+  });
+}
 
 // ---- Routes ----
 app.get("/health", (req, res) => res.json({ ok: true }));
@@ -104,50 +136,90 @@ app.post("/process-invoice", upload.single("file"), async (req, res) => {
     const doc = result.document || {};
     const entities = Array.isArray(doc.entities) ? doc.entities : [];
 
-    // Build clean output based on your custom extractor schema
-    const invoice_date = pickAny(entities, MAP.invoice_date);
-    const due_date = pickAny(entities, MAP.due_date);
-    const total_amount = pickAny(entities, MAP.total_amount);
+    // ---- Top-level fields (as per your schema) ----
+    const invoice_date = pick(entities, "invoice_date").value;
+    const due_date = pick(entities, "due_date").value;
+    const invoice_number = pick(entities, "invoice_number").value;
 
-    // Currency: your totalsum includes "kr" at the end, so we can derive it safely
-    const currency =
-      typeof total_amount.value === "string" && /kr/i.test(total_amount.value) ? "kr" : null;
+    const total_amount = pick(entities, "total_amount").value;
+    const net_amount = pick(entities, "net_amount").value;
+    const vat_amount = pick(entities, "vat_amount").value;
 
-    const response = {
-      invoice_id: null, // not in your schema yet
-      invoice_date: invoice_date.value, // normalized ISO date (e.g. 2026-02-08)
-      due_date: due_date.value,         // normalized ISO date (e.g. 2026-02-22)
-      invoice_type: "invoice_statement",
-      currency,
+    // ---- Groups: Supplier (single) ----
+    const supplier = {
+      Suppli_name: getFromGroupOrFlat(entities, "Supplier", "Suppli_name"),
+      Supplier_address: getFromGroupOrFlat(entities, "Supplier", "Supplier_address"),
+      supplier_email: getFromGroupOrFlat(entities, "Supplier", "supplier_email"),
+      Supplier_orgnr: getFromGroupOrFlat(entities, "Supplier", "Supplier_orgnr"),
+      Supplier_phone: getFromGroupOrFlat(entities, "Supplier", "Supplier_phone"),
+    };
 
-      supplier_name: "Ishavskraft", // not in schema; hardcode only if you want
-      supplier_website: null,
-      supplier_email: null,
-      supplier_phone: null,
-      supplier_address: null,
-      supplier_iban: null,
-      supplier_tax_id: null,
-      supplier_payment_ref: null,
+    // ---- Groups: Receiver (single) ----
+    const receiver = {
+      reciever_name: getFromGroupOrFlat(entities, "Reciever", "reciever_name"),
+      reciever_address: getFromGroupOrFlat(entities, "Reciever", "reciever_address"),
+    };
 
-      ship_to_address: pickAny(entities, MAP.ship_to_address).value,
-      customer_name: pickAny(entities, MAP.customer_name).value,
+    // ---- Groups: Meter (optional multiple) ----
+    const meterItems = getRepeatedGroupItems(entities, "Meter", [
+      "meter_number",
+      "meter_adress",
+      "grid_area",
+      "facility_id",
+      "consumption_kwh",
+      "estimated_annual_kwh",
+      "period_from",
+      "period_to",
+    ]);
 
-      total_amount: total_amount.value,
-      net_amount: null, // not in schema yet
+    // ---- Groups: Agreement (single) ----
+    const agreement = {
+      agreement_name: getFromGroupOrFlat(entities, "Agreement", "agreement_name"),
+      agreement_type: getFromGroupOrFlat(entities, "Agreement", "agreement_type"),
+      fixed_fee: getFromGroupOrFlat(entities, "Agreement", "fixed_fee"),
+      markup_ore: getFromGroupOrFlat(entities, "Agreement", "markup_ore"),
+      spot_price_ore: getFromGroupOrFlat(entities, "Agreement", "spot_price_ore"),
+    };
 
-      meter_number: pickAny(entities, MAP.meter_number).value,
-      usage_period_kwh: pickAny(entities, MAP.usage_period_kwh).value,
-      surcharge: pickAny(entities, MAP.surcharge).value,
-      price_area: pickAny(entities, MAP.price_area).value,
+    // ---- Groups: Additional_service (optional multiple) ----
+    const additional_service = getRepeatedGroupItems(entities, "Additional_service", [
+      "service_name",
+      "service_amount",
+      "service_vat",
+    ]);
 
-      line_items: [], // not in your schema yet
+    // ---- Response in your schema structure ----
+    const data = {
+      invoice_number,
+      invoice_date,
+      due_date,
+      net_amount,
+      vat_amount,
+      total_amount,
+
+      Supplier: supplier,
+      Reciever: receiver,
+      Meter: meterItems,
+      Agreement: agreement,
+      Additional_service: additional_service,
+    };
+
+    // Debug: raw entities (flattened) but without giant references
+    const raw_entities = flattenEntities(entities).map((x) => ({
+      type: x.type,
+      value: x.normalizedText || x.mentionText,
+      confidence: x.confidence,
+    }));
+
+    return res.json({
+      ok: true,
+      data,
+      raw_entities,
       debug: {
         entities_count: entities.length,
         processor: { projectId: PROJECT_ID, location: LOCATION, processorId: PROCESSOR_ID },
       },
-    };
-
-    return res.json(response);
+    });
   } catch (err) {
     return res.status(500).json({
       error: err?.message || String(err),
