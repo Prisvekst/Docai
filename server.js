@@ -31,64 +31,25 @@ function makeClient() {
 
   return new DocumentProcessorServiceClient(opts);
 }
+
 const client = makeClient();
 
-// ---- Helpers: entities -> structured ----
-function normalizedToText(normalizedValue) {
-  if (!normalizedValue) return null;
-  if (typeof normalizedValue === "string") return normalizedValue;
-  if (typeof normalizedValue.text === "string") return normalizedValue.text;
-  return null;
-}
-
-function entityToValue(entity) {
-  if (!entity) return null;
-  // Prefer normalizedValue.text if present
-  const nv = normalizedToText(entity.normalizedValue);
-  return nv || entity.mentionText || null;
-}
-
-function pickBestEntity(entities, type) {
-  const hits = (entities || []).filter((e) => e.type === type);
-  if (!hits.length) return null;
-  hits.sort((a, b) => (b.confidence ?? 0) - (a.confidence ?? 0));
-  return hits[0];
-}
-
-function field(entities, type) {
-  const e = pickBestEntity(entities, type);
+// ---- Helpers ----
+function normalizeEntity(e) {
   return {
-    value: entityToValue(e),
+    type: e?.type ?? null,
+    mentionText: e?.mentionText ?? null,
+    normalizedValue: e?.normalizedValue ?? null,
     confidence: typeof e?.confidence === "number" ? e.confidence : null,
+    properties: Array.isArray(e?.properties)
+      ? e.properties.map((p) => ({
+          type: p?.type ?? null,
+          mentionText: p?.mentionText ?? null,
+          normalizedValue: p?.normalizedValue ?? null,
+          confidence: typeof p?.confidence === "number" ? p.confidence : null,
+        }))
+      : [],
   };
-}
-
-function extractLineItems(entities) {
-  // Invoice Parser often returns line_item entities with properties
-  const lineEntities = (entities || []).filter((e) => e.type === "line_item");
-  return lineEntities.map((li) => {
-    const props = Array.isArray(li.properties) ? li.properties : [];
-
-    const propField = (t) => {
-      const p = pickBestEntity(props, t);
-      return {
-        value: entityToValue(p),
-        confidence: typeof p?.confidence === "number" ? p.confidence : null,
-      };
-    };
-
-    return {
-      description: propField("description"),
-      quantity: propField("quantity"),
-      unit: propField("unit"),
-      unit_price: propField("unit_price"),
-      amount: propField("amount"),
-      product_code: propField("product_code"),
-      tax_amount: propField("tax_amount"),
-      tax_rate: propField("tax_rate"),
-      confidence: typeof li?.confidence === "number" ? li.confidence : null,
-    };
-  });
 }
 
 // ---- Routes ----
@@ -107,7 +68,9 @@ app.post("/process-invoice", upload.single("file"), async (req, res) => {
     }
 
     if (!req.file) {
-      return res.status(400).json({ error: "Missing file (field name must be 'file')" });
+      return res.status(400).json({
+        error: "Missing file. Send multipart/form-data with field name: file",
+      });
     }
 
     const name = `projects/${PROJECT_ID}/locations/${LOCATION}/processors/${PROCESSOR_ID}`;
@@ -122,16 +85,28 @@ app.post("/process-invoice", upload.single("file"), async (req, res) => {
 
     const [result] = await client.processDocument(request);
     const doc = result.document || {};
+
+    // ✅ Custom Extractor: alt ligger i document.entities
     const entities = Array.isArray(doc.entities) ? doc.entities : [];
 
-    const doc = result.document || {};
-const entities = Array.isArray(doc.entities) ? doc.entities : [];
-
-return res.json({
-  entities_count: entities.length,
-  raw_entities: entities.map(e => ({
-    type: e.type,
-    mentionText: e.mentionText,
-    confidence: e.confidence
-  }))
+    // DEBUG OUTPUT: viser hva schemaet faktisk heter
+    return res.json({
+      ok: true,
+      processor: { projectId: PROJECT_ID, location: LOCATION, processorId: PROCESSOR_ID },
+      file: { originalname: req.file.originalname, bytes: req.file.size, mimeType: req.file.mimetype },
+      entities_count: entities.length,
+      raw_entities: entities.map(normalizeEntity),
+      // Hvis du vil sjekke at teksten finnes (for OCR), slå på:
+      // text_preview: (doc.text || "").slice(0, 1200),
+    });
+  } catch (err) {
+    return res.status(500).json({
+      error: err?.message || String(err),
+      code: err?.code ?? null,
+      details: err?.details ?? null,
+    });
+  }
 });
+
+const port = process.env.PORT || 8080;
+app.listen(port, () => console.log(`Running on port ${port}`));
